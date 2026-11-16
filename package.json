@@ -1,0 +1,15 @@
+{
+  "name": "download-speed-cli",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CLI utility that measures sequential HTTP download performance",
+  "main": "download-speed.js",
+  "scripts": {
+    "start": "node download-speed.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
