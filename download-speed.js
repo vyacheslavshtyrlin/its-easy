@@ -58,7 +58,7 @@ function parseRedirectUrl(location, currentUrl) {
   return nextUrl;
 }
 
-function requestOnce(url, remainingTimeoutMs, configuredTimeoutMs) {
+function performRequest(url, remainingTimeoutMs, configuredTimeoutMs) {
   const client = url.protocol === "https:" ? https : http;
 
   return new Promise((resolve, reject) => {
@@ -128,7 +128,7 @@ async function download(url, options = {}) {
       throw new Error(`Таймаут запроса (${timeoutMs} мс).`);
     }
 
-    const response = await requestOnce(currentUrl, remainingMs, timeoutMs);
+    const response = await performRequest(currentUrl, remainingMs, timeoutMs);
 
     if (isRedirect(response.statusCode, response.location)) {
       if (redirectCount >= maxRedirects) {
