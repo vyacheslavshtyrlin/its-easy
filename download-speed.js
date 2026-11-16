@@ -5,9 +5,15 @@
 const http = require("node:http");
 const https = require("node:https");
 const { performance } = require("node:perf_hooks");
+
 const REQUEST_COUNT = 10;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REDIRECTS = 5;
+const BYTES_PER_MEBIBYTE = 1024 * 1024;
+const REQUEST_HEADERS = {
+  "accept-encoding": "identity",
+  "user-agent": "download-speed-cli/1.0"
+};
 
 function parseUrl(value) {
   if (!value) {
@@ -28,120 +34,116 @@ function parseUrl(value) {
   return url;
 }
 
-function download(url, options = {}) {
-  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
-  const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
-
+function validateDownloadOptions(timeoutMs, maxRedirects) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return Promise.reject(new Error("Таймаут должен быть положительным числом."));
+    throw new Error("Таймаут должен быть положительным числом.");
   }
   if (!Number.isInteger(maxRedirects) || maxRedirects < 0) {
-    return Promise.reject(new Error("Лимит редиректов должен быть неотрицательным целым числом."));
+    throw new Error("Лимит редиректов должен быть неотрицательным целым числом.");
   }
-
-  const deadline = performance.now() + timeoutMs;
-  return downloadWithRedirects(url, maxRedirects, 0, deadline, timeoutMs);
 }
 
-function downloadWithRedirects(url, maxRedirects, redirectCount, deadline, timeoutMs) {
-  const client = url.protocol === "https:" ? https : http;
-  const remainingMs = deadline - performance.now();
-
-  if (remainingMs <= 0) {
-    return Promise.reject(new Error(`Таймаут запроса (${timeoutMs} мс).`));
+function parseRedirectUrl(location, currentUrl) {
+  let nextUrl;
+  try {
+    nextUrl = new URL(location, currentUrl);
+  } catch {
+    throw new Error(`Некорректный адрес редиректа: ${location}`);
   }
 
+  if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
+    throw new Error(`Редирект на неподдерживаемый протокол: ${nextUrl.protocol}`);
+  }
+
+  return nextUrl;
+}
+
+function requestOnce(url, remainingTimeoutMs, configuredTimeoutMs) {
+  const client = url.protocol === "https:" ? https : http;
+
   return new Promise((resolve, reject) => {
-    let settled = false;
+    let completed = false;
     let timer;
 
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
+    const complete = (callback, value) => {
+      if (completed) return;
+      completed = true;
       clearTimeout(timer);
       callback(value);
     };
-    const succeed = (value) => finish(resolve, value);
-    const fail = (error) => finish(reject, error);
+    const resolveOnce = (value) => complete(resolve, value);
+    const rejectOnce = (error) => complete(reject, error);
 
-    const request = client.get(
-      url,
-      {
-        headers: {
-          "accept-encoding": "identity",
-          "user-agent": "download-speed-cli/1.0"
-        }
-      },
-      (response) => {
-        if (settled) {
-          response.destroy();
-          return;
-        }
-
-        const statusCode = response.statusCode ?? 0;
-        const location = response.headers.location;
-
-        response.once("error", fail);
-        response.once("aborted", () => {
-          fail(new Error("Соединение разорвано до полного получения ответа."));
-        });
-
-        if (statusCode >= 300 && statusCode < 400 && location) {
-          response.resume();
-          response.once("end", () => {
-            if (settled) return;
-
-            if (redirectCount >= maxRedirects) {
-              fail(new Error(`Превышен лимит редиректов (${maxRedirects}).`));
-              return;
-            }
-
-            let nextUrl;
-            try {
-              nextUrl = new URL(location, url);
-            } catch {
-              fail(new Error(`Некорректный адрес редиректа: ${location}`));
-              return;
-            }
-
-            if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
-              fail(new Error(`Редирект на неподдерживаемый протокол: ${nextUrl.protocol}`));
-              return;
-            }
-
-            clearTimeout(timer);
-            downloadWithRedirects(
-              nextUrl,
-              maxRedirects,
-              redirectCount + 1,
-              deadline,
-              timeoutMs
-            ).then(succeed, fail);
-          });
-          return;
-        }
-
-        let bytes = 0;
-        response.on("data", (chunk) => {
-          bytes += chunk.length;
-        });
-        response.once("end", () => {
-          if (statusCode < 200 || statusCode >= 300) {
-            fail(new Error(`Сервер ответил с HTTP-статусом ${statusCode}.`));
-            return;
-          }
-          succeed(bytes);
-        });
+    const request = client.get(url, { headers: REQUEST_HEADERS }, (response) => {
+      if (completed) {
+        response.destroy();
+        return;
       }
-    );
+
+      let bytes = 0;
+      response.on("data", (chunk) => {
+        bytes += chunk.length;
+      });
+      response.once("end", () => {
+        resolveOnce({
+          bytes,
+          location: response.headers.location,
+          statusCode: response.statusCode ?? 0
+        });
+      });
+      response.once("error", rejectOnce);
+      response.once("aborted", () => {
+        rejectOnce(new Error("Соединение разорвано до полного получения ответа."));
+      });
+    });
 
     timer = setTimeout(() => {
-      const error = new Error(`Таймаут запроса (${timeoutMs} мс).`);
+      const error = new Error(`Таймаут запроса (${configuredTimeoutMs} мс).`);
       request.destroy(error);
-      fail(error);
-    }, remainingMs);
-    request.once("error", fail);
+      rejectOnce(error);
+    }, remainingTimeoutMs);
+    request.once("error", rejectOnce);
   });
+}
+
+function isRedirect(statusCode, location) {
+  return statusCode >= 300 && statusCode < 400 && Boolean(location);
+}
+
+function isSuccessful(statusCode) {
+  return statusCode >= 200 && statusCode < 300;
+}
+
+async function download(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
+  validateDownloadOptions(timeoutMs, maxRedirects);
+
+  const deadline = performance.now() + timeoutMs;
+  let currentUrl = url;
+
+  for (let redirectCount = 0; ; redirectCount += 1) {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) {
+      throw new Error(`Таймаут запроса (${timeoutMs} мс).`);
+    }
+
+    const response = await requestOnce(currentUrl, remainingMs, timeoutMs);
+
+    if (isRedirect(response.statusCode, response.location)) {
+      if (redirectCount >= maxRedirects) {
+        throw new Error(`Превышен лимит редиректов (${maxRedirects}).`);
+      }
+      currentUrl = parseRedirectUrl(response.location, currentUrl);
+      continue;
+    }
+
+    if (!isSuccessful(response.statusCode)) {
+      throw new Error(`Сервер ответил с HTTP-статусом ${response.statusCode}.`);
+    }
+
+    return response.bytes;
+  }
 }
 
 async function measureDownloads(url, options = {}) {
@@ -171,19 +173,23 @@ async function measureDownloads(url, options = {}) {
     totalBytes,
     totalDurationMs,
     averageDurationMs: totalDurationMs / requestCount,
-    speedMiBPerSecond:
-      totalDurationMs === 0
-        ? 0
-        : (totalBytes / (1024 * 1024)) / (totalDurationMs / 1000),
+    speedMiBPerSecond: calculateSpeed(totalBytes, totalDurationMs),
     requests
   };
 }
 
+function calculateSpeed(totalBytes, totalDurationMs) {
+  if (totalDurationMs === 0) return 0;
+  return (totalBytes / BYTES_PER_MEBIBYTE) / (totalDurationMs / 1000);
+}
+
 function formatResults(results) {
+  const totalMiB = (results.totalBytes / BYTES_PER_MEBIBYTE).toFixed(2);
+
   return [
     `Запросов: ${results.requestCount}`,
     `Среднее время запроса: ${results.averageDurationMs.toFixed(2)} мс`,
-    `Скачано всего: ${results.totalBytes} байт (${(results.totalBytes / (1024 * 1024)).toFixed(2)} MiB)`,
+    `Скачано всего: ${results.totalBytes} байт (${totalMiB} MiB)`,
     `Средняя скорость скачивания: ${results.speedMiBPerSecond.toFixed(2)} MiB/s`
   ].join("\n");
 }
