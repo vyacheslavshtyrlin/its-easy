@@ -28,12 +28,42 @@ function parseUrl(value) {
   return url;
 }
 
-function download(url, options = {}, redirectCount = 0) {
+function download(url, options = {}) {
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
+
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new Error("Таймаут должен быть положительным числом."));
+  }
+  if (!Number.isInteger(maxRedirects) || maxRedirects < 0) {
+    return Promise.reject(new Error("Лимит редиректов должен быть неотрицательным целым числом."));
+  }
+
+  const deadline = performance.now() + timeoutMs;
+  return downloadWithRedirects(url, maxRedirects, 0, deadline, timeoutMs);
+}
+
+function downloadWithRedirects(url, maxRedirects, redirectCount, deadline, timeoutMs) {
   const client = url.protocol === "https:" ? https : http;
+  const remainingMs = deadline - performance.now();
+
+  if (remainingMs <= 0) {
+    return Promise.reject(new Error(`Таймаут запроса (${timeoutMs} мс).`));
+  }
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const succeed = (value) => finish(resolve, value);
+    const fail = (error) => finish(reject, error);
+
     const request = client.get(
       url,
       {
@@ -43,24 +73,50 @@ function download(url, options = {}, redirectCount = 0) {
         }
       },
       (response) => {
+        if (settled) {
+          response.destroy();
+          return;
+        }
+
         const statusCode = response.statusCode ?? 0;
         const location = response.headers.location;
+
+        response.once("error", fail);
+        response.once("aborted", () => {
+          fail(new Error("Соединение разорвано до полного получения ответа."));
+        });
 
         if (statusCode >= 300 && statusCode < 400 && location) {
           response.resume();
           response.once("end", () => {
+            if (settled) return;
+
             if (redirectCount >= maxRedirects) {
-              reject(new Error(`Превышен лимит редиректов (${maxRedirects}).`));
+              fail(new Error(`Превышен лимит редиректов (${maxRedirects}).`));
               return;
             }
 
-            const nextUrl = new URL(location, url);
+            let nextUrl;
+            try {
+              nextUrl = new URL(location, url);
+            } catch {
+              fail(new Error(`Некорректный адрес редиректа: ${location}`));
+              return;
+            }
+
             if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
-              reject(new Error(`Редирект на неподдерживаемый протокол: ${nextUrl.protocol}`));
+              fail(new Error(`Редирект на неподдерживаемый протокол: ${nextUrl.protocol}`));
               return;
             }
 
-            download(nextUrl, options, redirectCount + 1).then(resolve, reject);
+            clearTimeout(timer);
+            downloadWithRedirects(
+              nextUrl,
+              maxRedirects,
+              redirectCount + 1,
+              deadline,
+              timeoutMs
+            ).then(succeed, fail);
           });
           return;
         }
@@ -71,25 +127,31 @@ function download(url, options = {}, redirectCount = 0) {
         });
         response.once("end", () => {
           if (statusCode < 200 || statusCode >= 300) {
-            reject(new Error(`Сервер ответил с HTTP-статусом ${statusCode}.`));
+            fail(new Error(`Сервер ответил с HTTP-статусом ${statusCode}.`));
             return;
           }
-          resolve(bytes);
+          succeed(bytes);
         });
-        response.once("error", reject);
       }
     );
 
-    request.setTimeout(timeoutMs, () => {
-      request.destroy(new Error(`Таймаут запроса (${timeoutMs} мс).`));
-    });
-    request.once("error", reject);
+    timer = setTimeout(() => {
+      const error = new Error(`Таймаут запроса (${timeoutMs} мс).`);
+      request.destroy(error);
+      fail(error);
+    }, remainingMs);
+    request.once("error", fail);
   });
 }
 
 async function measureDownloads(url, options = {}) {
   const requestCount = options.requestCount ?? REQUEST_COUNT;
   const now = options.now ?? (() => performance.now());
+
+  if (!Number.isInteger(requestCount) || requestCount <= 0) {
+    throw new Error("Количество запросов должно быть положительным целым числом.");
+  }
+
   let totalBytes = 0;
   let totalDurationMs = 0;
   const requests = [];

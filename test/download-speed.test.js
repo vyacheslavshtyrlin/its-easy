@@ -1,9 +1,12 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { execFile } = require("node:child_process");
 const http = require("node:http");
 const { once } = require("node:events");
+const path = require("node:path");
 const { after, before, test } = require("node:test");
+const { promisify } = require("node:util");
 
 const {
   download,
@@ -17,6 +20,7 @@ let baseUrl;
 let requestCount;
 let activeRequests;
 let maxActiveRequests;
+const execFileAsync = promisify(execFile);
 
 before(async () => {
   server = http.createServer((request, response) => {
@@ -29,6 +33,26 @@ before(async () => {
     if (request.url === "/error") {
       response.writeHead(503);
       response.end("unavailable");
+      return;
+    }
+
+    if (request.url === "/invalid-redirect") {
+      response.writeHead(302, { location: "http://[invalid" });
+      response.end();
+      return;
+    }
+
+    if (request.url === "/aborted-redirect") {
+      response.writeHead(302, { location: "/data" });
+      response.write("partial");
+      response.socket.destroy();
+      return;
+    }
+
+    if (request.url === "/slow") {
+      response.writeHead(200);
+      const interval = setInterval(() => response.write("x"), 5);
+      response.once("close", () => clearInterval(interval));
       return;
     }
 
@@ -95,6 +119,62 @@ test("ограничивает число редиректов", async () => {
   );
 });
 
+test("отклоняет некорректный адрес редиректа", async () => {
+  await assert.rejects(
+    download(new URL(`${baseUrl}/invalid-redirect`)),
+    /Некорректный адрес редиректа/
+  );
+});
+
+test("обрабатывает разрыв соединения во время редиректа", async () => {
+  await assert.rejects(
+    download(new URL(`${baseUrl}/aborted-redirect`)),
+    /разорвано|socket hang up/
+  );
+});
+
+test("ограничивает полное время ответа, даже если данные продолжают поступать", async () => {
+  const startedAt = performance.now();
+
+  await assert.rejects(
+    download(new URL(`${baseUrl}/slow`), { timeoutMs: 30 }),
+    /Таймаут запроса/
+  );
+
+  assert.ok(performance.now() - startedAt < 500);
+});
+
+test("валидирует программные настройки", async () => {
+  await assert.rejects(
+    measureDownloads(new URL(`${baseUrl}/data`), { requestCount: 0 }),
+    /Количество запросов/
+  );
+  await assert.rejects(
+    download(new URL(`${baseUrl}/data`), { timeoutMs: 0 }),
+    /Таймаут/
+  );
+  await assert.rejects(
+    download(new URL(`${baseUrl}/data`), { maxRedirects: -1 }),
+    /Лимит редиректов/
+  );
+});
+
+test("точно рассчитывает среднее время и скорость", async () => {
+  const timestamps = [0, 100, 100, 300];
+  const result = await measureDownloads(new URL(`${baseUrl}/data`), {
+    requestCount: 2,
+    now: () => timestamps.shift()
+  });
+
+  assert.equal(result.totalBytes, 2 * 1024);
+  assert.equal(result.totalDurationMs, 300);
+  assert.equal(result.averageDurationMs, 150);
+  assert.equal(
+    result.speedMiBPerSecond,
+    (2 * 1024 / (1024 * 1024)) / 0.3
+  );
+});
+
 test("форматирует единицы измерения", () => {
   const output = formatResults({
     requestCount: 10,
@@ -106,4 +186,13 @@ test("форматирует единицы измерения", () => {
   assert.match(output, /100\.00 мс/);
   assert.match(output, /1\.00 MiB/);
   assert.match(output, /1\.00 MiB\/s/);
+});
+
+test("CLI завершается с ошибкой при запуске без URL", async () => {
+  const scriptPath = path.resolve(__dirname, "../download-speed.js");
+
+  await assert.rejects(
+    execFileAsync(process.execPath, [scriptPath]),
+    (error) => error.code === 1 && /Укажите URL/.test(error.stderr)
+  );
 });
